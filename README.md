@@ -2,6 +2,6 @@
 
 Group Name- CPE301 Swamp Cooler Project BKG
 
-Brandon Rowell /n
+Brandon Rowell 
 Kiana Partovi 
 Biniam Gashaw
