@@ -14,7 +14,7 @@ volatile unsigned char* port_j = (unsigned char*) 0x105;
 volatile unsigned char* ddr_j  = (unsigned char*) 0x104; 
 volatile unsigned char* pin_j  = (unsigned char*) 0x103; 
 
-//Port PH1, pin16 for red light
+//Port PH1 & PH0, pin16 & pin17 for red and blue light 
 volatile unsigned char* port_h = (unsigned char*) 0x102; 
 volatile unsigned char* ddr_h  = (unsigned char*) 0x101; 
 volatile unsigned char* pin_h  = (unsigned char*) 0x100; 
@@ -31,6 +31,7 @@ const int stepsPerRevolution = 2038; //number of steps per rotation
 Stepper myStepper = Stepper(stepsPerRevolution, 8, 10, 9, 11);
 
 void stepperDirection();
+void controlVent();
 
 //Port PK2 for pin A10
 volatile unsigned char* port_k = (unsigned char*) 0x108; 
@@ -64,8 +65,43 @@ volatile unsigned char* ddr_b  = (unsigned char*) 0x24;
 volatile unsigned char* pin_b  = (unsigned char*) 0x23;
 
 unsigned int waterSensorVal;
-void waterLevel();
+void errorState();
 void checkWaterLv();
+
+
+
+// LCD and Fan for Temp & Humidity 
+#include <dht.h> //install the DHTLib library
+dht DHT;
+#define DHT11_PIN 12
+
+#include <LiquidCrystal.h>
+
+// LCD pins <--> Arduino pins
+const int RS = 6, EN = 7, D4 = 2, D5 = 3, D6 = 4, D7 = 5;
+
+LiquidCrystal lcd(RS, EN, D4, D5, D6, D7);
+
+void lcdDisplay();
+void getReadings();
+
+unsigned int temp = 0;
+unsigned int humidity = 0;
+
+//Port PA0 for pin22 for fan
+volatile unsigned char* port_a = (unsigned char*) 0x22; 
+volatile unsigned char* ddr_a  = (unsigned char*) 0x21; 
+volatile unsigned char* pin_a  = (unsigned char*) 0x20;
+
+void updateLCD();
+unsigned long currentTime = 0;
+unsigned long pastTime = 0;
+const long interval = 60000;
+
+//handle the different states 
+void idleState();
+void runningState();
+void errorState();
 
 
 
@@ -80,44 +116,38 @@ void setup() {
   *ddr_j |= 0x01;
   //set PH1 as output 
   *ddr_h |= 0x02;
+  //set PH0 as output 
+  *ddr_h |= 0x01;
   //set PD2 as input with pullup 
   *ddr_d &= 0xFB;
-  *port_d |= 0x04;  
+  *port_d |= 0x04; 
+
+  //ISR 
   attachInterrupt(digitalPinToInterrupt(18), buttonISR, FALLING);
 
-  //set PK2 as input with pullup
-  *ddr_k &= 0xFB;
+  //Stepper Motor
+  *ddr_k &= 0xFB; //set PK2 as input with pullup
   *port_k |= 0x04;
   myStepper.setSpeed(10);
 
-
+  //Temp & Humidity sensor + LCD 
   adc_init(); //setting up ADC
-  //set PB7 as output
-  *ddr_b |= 0x80;
+  *ddr_b |= 0x80; //set PB7 as output
   *port_b &= 0x7F; //starting with sensor off
+  *ddr_a |= 0x01;   // Set PA0 set to output
+  *port_a &= ~0x01; // make sure fan off to start
+  lcd.begin(16,2); //setup cols and rows
 }
 
 void loop() {
-  if(masterButton == 0){
+  if(masterButton == 0){ //in the DISABLED state
     *port_j |= 0x02; //turning on yellow LED
     *port_j &= 0xFE; //turning off green LED  
   }
   else{
-  *port_j &= 0xFD; //turning off yellow LED, moving out of disabled state
-  *port_j |= 0x01; //turn on green LED, in idle state
-
-  //control vent here 
-  if(*pin_k & 0x04){
-    stepperDirection();  
+    //runs until the conditions for the other two states are met in which they are entered 
+    idleState();
   }
-
-  //checking water sensor level
-  waterLevel();
-
-  //everything else for system goes here when NOT disabled 
-  
-  }
-  delay(100); 
 }
 
 void buttonISR() {
@@ -125,11 +155,111 @@ void buttonISR() {
   masterButton %= 2; //Keep as 1's and 0's aka on/off
 }
 
-//function for switching vent direction
+//handles general idle state stuff
+void idleState(){
+    *port_j &= 0xFD; //turning off yellow LED, moving out of disabled state
+    *port_j |= 0x01; //turn on green LED, in idle state
+    updateLCD(); //should still be updating the LCD once per min
+    controlVent(); //stepper should be controllable here 
+    getReading(); //updating current temp and humidity 
+
+    //runs as long as the temperature threshold is exceeded 
+    runningState();
+
+    //runs until water level is satisfied AND reset button is pressed 
+    errorState();
+}
+
+//activates and disables running state based on set temperature threshold 
+void runningState(){
+  Serial.println(temp);
+  while(temp > 31){
+    Serial.println(temp);
+    *port_j &= 0xFE; //turning off green LED
+    *port_h |= 0x01; //turn blue light on
+    *port_a |= 0x01;  // turn on fan
+    getReading(); //looking for when we drop below the threshold
+    updateLCD(); //should still be updating the LCD once per min
+    controlVent(); //should be able to adjust vent here still
+
+    //water level error supercedes this state, so we go here if water level is too low 
+    errorState();
+  }
+  *port_h &= 0xFE; //turn blue light off
+  *port_a &= ~0x01; // turn off fan  
+}
+
+//activates and exits error state if water level too low/high, and requires reset button and adequate water level to exit state
+void errorState(){
+  checkWaterLv();
+  Serial.println(waterSensorVal);
+  while((waterSensorVal <= 10)){
+      while(((*pin_d & 0x04) == 0)){ //stay in ERROR state until reset button pressed AND water level is no longer zero
+      *port_h &= 0xFE; //turn blue light off
+      *port_j &= 0xFE; //turning off green LED
+      *port_h |= 0x02; //turn red light on
+      Serial.println("Error water level low!");
+      checkWaterLv();
+      controlVent(); //should be able to adjust vent here still
+      getReading(); //still tracking temp and humidity 
+      updateLCD(); //should still be updating the LCD once per min
+    }
+  }
+  *port_h &= 0xFD; //turn red light off 
+}
+
+void controlVent(){
+    //control vent here 
+    if(*pin_k & 0x04){
+      stepperDirection();  
+    }  
+}
+
+//for switching vent direction
 int currentDir = stepsPerRevolution; //global variable to switch direction by changing sign
 void stepperDirection(){
     currentDir = (-1) * currentDir;
     myStepper.step(currentDir);
+}
+
+//continuously measures the temp and humidity
+void getReading(){
+    delay(1000);
+
+    int statusCheck = DHT.read11(DHT11_PIN);
+    temp = DHT.temperature;
+    humidity = DHT.humidity;
+}
+
+//continuously reads the water level 
+void checkWaterLv(){
+  delay(1000);
+
+  *port_b |= 0x80; // turn the sensor on
+  waterSensorVal = adc_read(0); // read the analog value from water sensor
+  *port_b &= 0x7F; // turn the water sensor off
+}
+
+void updateLCD(){
+    //updating LCD with temp & humidity once per minute
+    currentTime = millis();
+    if((currentTime - pastTime) >= interval){
+      lcdDisplay();
+      pastTime = currentTime;
+    }
+}
+
+//displaying to LCD once per minute 
+void lcdDisplay(){ //referenced circuit basics website for DTH info 
+    lcd.setCursor(0,0); 
+    lcd.print("Temp: ");
+    lcd.print(temp);
+    lcd.print((char)223);
+    lcd.print("C");
+    lcd.setCursor(0,1);
+    lcd.print("Humidity: ");
+    lcd.print(humidity);
+    lcd.print("%");
 }
 
 void adc_init()
@@ -195,24 +325,4 @@ void U0putchar(unsigned char U0pdata) //transmit buffer, wait for USART0 TBE to 
 {
   while((*myUCSR0A & TBE)==0); //waiting for transmit buffer to be empty and flag to change to know when a new character can be written to it 
   *myUDR0 = U0pdata;
-}
-
-void waterLevel(){
-  checkWaterLv();
-  while((waterSensorVal == 0)){
-      while(((*pin_d & 0x04) == 0)){ //stay in ERROR state until reset button pressed AND water level is no longer zero
-      *port_j &= 0xFE; //turning off green LED
-      *port_h |= 0x02; //turn red light on
-      Serial.println("Error water level low!");
-      checkWaterLv();
-    }
-  }
-  *port_h &= 0xFD; //turn red light off 
-}
-
-void checkWaterLv(){
-  *port_b |= 0x80; // turn the sensor on
-  delay(10); // wait 10 milliseconds
-  waterSensorVal = adc_read(0); // read the analog value from water sensor
-  *port_b &= 0x7F; // turn the water sensor off
 }
