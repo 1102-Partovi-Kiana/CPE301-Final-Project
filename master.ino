@@ -21,6 +21,8 @@ volatile unsigned char* pin_h  = (unsigned char*) 0x100;
 
 volatile int masterButton = 0;
 
+void masterButtonCheck();
+
 
 
 //STEPPER MOTOR 
@@ -45,6 +47,21 @@ volatile unsigned char* pin_k  = (unsigned char*) 0x106;
 #define POWER_PIN 13
 #define SIGNAL_PIN A0
 
+//Port PB7 for pin13
+volatile unsigned char* port_b = (unsigned char*) 0x25; 
+volatile unsigned char* ddr_b  = (unsigned char*) 0x24; 
+volatile unsigned char* pin_b  = (unsigned char*) 0x23;
+
+unsigned int waterSensorVal;
+void errorState();
+void checkWaterLv();
+
+
+
+// UART and RTC stuff 
+
+#include <RTClib.h>
+
 #define RDA 0x80
 #define TBE 0x20  
 
@@ -57,16 +74,11 @@ volatile unsigned char *myUDR0   = (unsigned char *)0x00C6;
 volatile unsigned char* my_ADMUX = (unsigned char*) 0x7C;
 volatile unsigned char* my_ADCSRB = (unsigned char*) 0x7B;
 volatile unsigned char* my_ADCSRA = (unsigned char*) 0x7A;
-volatile unsigned int* my_ADC_DATA = (unsigned int*) 0x78;
+volatile unsigned int* my_ADC_DATA = (unsigned int*) 0x78; 
 
-//Port PB7 for pin13
-volatile unsigned char* port_b = (unsigned char*) 0x25; 
-volatile unsigned char* ddr_b  = (unsigned char*) 0x24; 
-volatile unsigned char* pin_b  = (unsigned char*) 0x23;
+RTC_DS1307 rtc;
 
-unsigned int waterSensorVal;
-void errorState();
-void checkWaterLv();
+void stateChangeUART();
 
 
 
@@ -124,6 +136,7 @@ void setup() {
 
   //ISR 
   attachInterrupt(digitalPinToInterrupt(18), buttonISR, FALLING);
+  *port_j |= 0x02; //turning on yellow LED
 
   //Stepper Motor
   *ddr_k &= 0xFB; //set PK2 as input with pullup
@@ -137,75 +150,109 @@ void setup() {
   *ddr_a |= 0x01;   // Set PA0 set to output
   *port_a &= ~0x01; // make sure fan off to start
   lcd.begin(16,2); //setup cols and rows
+
+  //RTC
+  rtc.begin();
+  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
 }
 
 void loop() {
-  if(masterButton == 0){ //in the DISABLED state
-    *port_j |= 0x02; //turning on yellow LED
-    *port_j &= 0xFE; //turning off green LED  
-  }
-  else{
+    //start in disabled state but check idle 
     //runs until the conditions for the other two states are met in which they are entered 
     idleState();
-  }
 }
 
-void buttonISR() {
+
+void disabledState(){
+  stateChangeUART(); //entering new state
+  *port_j |= 0x02; //turning on yellow LED
+  *port_j &= 0xFE; //turning off green LED 
+  *port_h &= 0xFE; //turn off blue LED 
+  *port_h &= 0xFD; //turn off red LED 
+  *port_a &= ~0x01; // turn off fan  
+  while(masterButton == 0){ //in the DISABLED state
+    //stay here 
+  }
+  stateChangeUART(); //leaving state
+}
+
+void buttonISR() { //ISR
   masterButton++; 
   masterButton %= 2; //Keep as 1's and 0's aka on/off
 }
 
-//handles general idle state stuff
 void idleState(){
+    if(masterButton == 0){ //check if transition to Disabled 
+      disabledState();
+    }
     *port_j &= 0xFD; //turning off yellow LED, moving out of disabled state
-    *port_j |= 0x01; //turn on green LED, in idle state
+    *port_j |= 0x01; //turn on green LED
+    *port_h &= 0xFE; //turn blue light off
+    *port_a &= ~0x01; // turn off fan
+    *port_h &= 0xFD; //turn red light off
+    
     updateLCD(); //should still be updating the LCD once per min
     controlVent(); //stepper should be controllable here 
     getReading(); //updating current temp and humidity 
 
     //runs as long as the temperature threshold is exceeded 
-    runningState();
+    if(temp > 40){
+      runningState();
+    }
 
     //runs until water level is satisfied AND reset button is pressed 
-    errorState();
+    checkWaterLv();
+    if(waterSensorVal <= 10){
+      errorState();  
+    }
+    delay(1000);
 }
 
-//activates and disables running state based on set temperature threshold 
 void runningState(){
-  Serial.println(temp);
-  while(temp > 31){
-    Serial.println(temp);
-    *port_j &= 0xFE; //turning off green LED
-    *port_h |= 0x01; //turn blue light on
-    *port_a |= 0x01;  // turn on fan
+  stateChangeUART();
+  *port_h |= 0x01; //turn blue light on
+  *port_a |= 0x01;  // turn on fan 
+  *port_j &= 0xFE; //turning off green LED
+  *port_h &= 0xFD; //turn off red LED  
+
+  while(temp > 40){
     getReading(); //looking for when we drop below the threshold
     updateLCD(); //should still be updating the LCD once per min
     controlVent(); //should be able to adjust vent here still
-
     //water level error supercedes this state, so we go here if water level is too low 
-    errorState();
+    checkWaterLv();
+    if(waterSensorVal <= 10){
+      errorState();  
+    }
+    delay(1000);
   }
-  *port_h &= 0xFE; //turn blue light off
-  *port_a &= ~0x01; // turn off fan  
+  stateChangeUART(); 
+  
 }
 
-//activates and exits error state if water level too low/high, and requires reset button and adequate water level to exit state
 void errorState(){
-  checkWaterLv();
-  Serial.println(waterSensorVal);
+  stateChangeUART();
+  *port_h &= 0xFE; //turn blue light off
+  *port_j &= 0xFE; //turning off green LED
+  *port_a &= ~0x01; // make sure fan is off
+  *port_h |= 0x02; //turn red light on
+  //Error message on LCD displayed
+  lcd.clear();
+  lcd.setCursor(0,0); 
+  lcd.print("Error water");
+  lcd.setCursor(0,1);
+  lcd.print("level low!");
+
   while((waterSensorVal <= 10)){
       while(((*pin_d & 0x04) == 0)){ //stay in ERROR state until reset button pressed AND water level is no longer zero
-      *port_h &= 0xFE; //turn blue light off
-      *port_j &= 0xFE; //turning off green LED
-      *port_h |= 0x02; //turn red light on
-      Serial.println("Error water level low!");
-      checkWaterLv();
-      controlVent(); //should be able to adjust vent here still
-      getReading(); //still tracking temp and humidity 
-      updateLCD(); //should still be updating the LCD once per min
+        checkWaterLv();
+        controlVent(); //should be able to adjust vent here still
+        getReading(); //still tracking temp and humidity 
+        updateLCD(); //should still be updating the LCD once per min
     }
   }
-  *port_h &= 0xFD; //turn red light off 
+  lcd.clear(); //get rid of error message
+  stateChangeUART(); //leaving this state so indicate state message
 }
 
 void controlVent(){
@@ -220,24 +267,31 @@ int currentDir = stepsPerRevolution; //global variable to switch direction by ch
 void stepperDirection(){
     currentDir = (-1) * currentDir;
     myStepper.step(currentDir);
+    
+    //indicating using UART vent position is changed 
+    char motorChangeMsg[23] = "Vent Direction Changed!";
+    for(int j = 0; j < 23; j++){
+      U0putchar(motorChangeMsg[j]);
+    }
+    U0putchar('\n');
 }
 
 //continuously measures the temp and humidity
 void getReading(){
-    delay(1000);
 
     int statusCheck = DHT.read11(DHT11_PIN);
     temp = DHT.temperature;
     humidity = DHT.humidity;
+
+    delay(1000);
 }
 
 //continuously reads the water level 
 void checkWaterLv(){
-  delay(1000);
-
   *port_b |= 0x80; // turn the sensor on
   waterSensorVal = adc_read(0); // read the analog value from water sensor
   *port_b &= 0x7F; // turn the water sensor off
+  delay(1000);
 }
 
 void updateLCD(){
@@ -260,6 +314,69 @@ void lcdDisplay(){ //referenced circuit basics website for DTH info
     lcd.print("Humidity: ");
     lcd.print(humidity);
     lcd.print("%");
+}
+
+//fxn that outputs messages when a state change occurs 
+void stateChangeUART(){
+  DateTime now = rtc.now();
+
+  //store values 
+  int year = now.year();
+  int month = now.month();
+  int day = now.day();
+  int hour = now.hour();
+  int minute = now.minute();
+  int second = now.second();
+
+  delay(1000);
+
+  //state change message
+  char stateMsg[17] = "State change at: ";
+  for(int i = 0; i < 17; i++){
+    U0putchar(stateMsg[i]);
+  }
+
+  //converting hour 
+  U0putchar(hour/10 + '0');
+  hour %= 10;
+  U0putchar(hour + '0');
+  U0putchar(':');
+
+  //converting minute
+  U0putchar(minute/10 + '0');
+  minute %= 10;
+  U0putchar(minute + '0');
+  U0putchar(':');
+
+  //converting second 
+  U0putchar(second/10 + '0');
+  second %= 10;
+  U0putchar(second + '0');
+
+  U0putchar(' ');
+
+  //converting day 
+  U0putchar(day/10 + '0');
+  day %= 10;
+  U0putchar(day + '0');
+  U0putchar('/');
+
+  //converting month 
+  U0putchar(month/10 + '0');
+  month %= 10;
+  U0putchar(month + '0');
+  U0putchar('/');
+
+  //converting year 
+  U0putchar(year/1000 + '0');
+  year %= 1000;
+  U0putchar(year/100 + '0');
+  year %= 100;
+  U0putchar(year/10 + '0');
+  year %= 10;
+  U0putchar(year + '0');
+
+  U0putchar('\n');
 }
 
 void adc_init()
